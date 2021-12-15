@@ -4,7 +4,7 @@
 
 [![badge-discord][]][link-discord] [![badge-matrix][]][link-matrix] [![badge-opencollective][]][link-opencollective]
 
-This is going to be a modified source of ALVR to enable wired streaming, kind of like Oculus Link, for Linux. This is not where the main branch of the source is at, to see the source, go to the [ORLL](https://github.com/MilkJug1/OculusLinkLinux).
+**This is going to be a modified source of ALVR to enable wired streaming, kind of like Oculus Link, for Linux. This is not where the main branch of the source is at, to see the source, go to the [ORLL](https://github.com/MilkJug1/OculusLinkLinux).**
 
 Stream VR games from your PC to your headset via Wi-Fi.  
 ALVR uses technologies like [Asynchronous Timewarp](https://developer.oculus.com/documentation/native/android/mobile-timewarp-overview) and [Fixed Foveated Rendering](https://developer.oculus.com/documentation/native/android/mobile-ffr) for a smoother experience.  
@@ -13,14 +13,12 @@ This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
 
 |    Headset     |                        Support                         |
 | :------------: | :----------------------------------------------------: |
-|  Oculus Quest  |                   :heavy_check_mark:                   |
-| Oculus Quest 2 |                   :heavy_check_mark:                   |
-|   Oculus Go    |           :heavy_check_mark: (no controller)           |
-|     GearVR     | :x: (use [this](https://github.com/polygraphene/ALVR)) |
+|  Oculus Quest  |                   :?:                   |
+| Oculus Quest 2 |                   :?:                   |
 
 ## Requirements
 
--   Oculus Quest, Oculus Quest 2 or Oculus Go on the latest firmware  
+-   Oculus Quest, Oculus Quest 2 on the latest firmware  
 
 -   SteamVR  
 
