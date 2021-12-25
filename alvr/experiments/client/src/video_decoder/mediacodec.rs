@@ -1,26 +1,28 @@
 use alvr_common::{glam::UVec2, log, prelude::*};
-use alvr_graphics::GraphicsContext;
+use alvr_graphics::{
+    wgpu::{
+        CommandEncoder, Device, Extent3d, ImageCopyTexture, Origin3d, Surface, Texture,
+        TextureAspect, TextureView,
+    },
+    GraphicsContext,
+};
 use alvr_session::{CodecType, MediacodecDataType};
 use ndk::{
     hardware_buffer::HardwareBufferUsage,
     media::image_reader::{ImageFormat, ImageReader},
 };
 use ndk_sys as sys;
-use raw_window_handle::{android::AndroidHandle, HasRawWindowHandle, RawWindowHandle};
+use raw_window_handle::{AndroidNdkHandle, HasRawWindowHandle, RawWindowHandle};
 use std::{ffi::CString, ptr, sync::Arc, time::Duration};
-use wgpu::{
-    CommandEncoder, Device, Extent3d, ImageCopyTexture, Origin3d, Surface, Texture, TextureAspect,
-    TextureView,
-};
 
 pub struct SurfaceHandle(*mut sys::ANativeWindow);
 
 unsafe impl HasRawWindowHandle for SurfaceHandle {
     fn raw_window_handle(&self) -> RawWindowHandle {
-        RawWindowHandle::Android(AndroidHandle {
-            a_native_window: self.0 as _,
-            ..AndroidHandle::empty()
-        })
+        let mut handle = AndroidNdkHandle::empty();
+        handle.a_native_window = self.0 as _;
+
+        RawWindowHandle::AndroidNdk(handle)
     }
 }
 
@@ -32,11 +34,19 @@ pub struct VideoDecoder {
     video_size: UVec2,
 }
 
+unsafe impl Send for VideoDecoder {}
+
+// fixme: MediaCodec is not actually Sync. push_frame_nals() and get_output_frame() can be called
+// concurrently but not multiple concurrent push_frame_nals() or get_output_frame(). The best way to
+// handle this is to have a Enqueuer and Dequeuer that are !Sync.
+unsafe impl Sync for VideoDecoder {}
+
 impl VideoDecoder {
     pub fn new(
         context: Arc<GraphicsContext>,
         codec_type: CodecType,
         video_size: UVec2,
+        csd_0: Vec<u8>,
         extra_options: &[(String, MediacodecDataType)],
     ) -> StrResult<Self> {
         log::error!("create video decoder");

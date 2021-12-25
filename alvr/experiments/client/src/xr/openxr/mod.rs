@@ -13,9 +13,8 @@ use alvr_common::{
     prelude::*,
     Fov, MotionData,
 };
-use alvr_graphics::GraphicsContext;
+use alvr_graphics::{ash::vk::Handle, wgpu::TextureView, GraphicsContext};
 use alvr_session::TrackingSpace;
-use ash::vk::Handle;
 use openxr as xr;
 use parking_lot::{Mutex, MutexGuard};
 use std::{
@@ -27,7 +26,6 @@ use std::{
     thread,
     time::Duration,
 };
-use wgpu::TextureView;
 
 pub struct XrContext {
     pub instance: xr::Instance,
@@ -218,6 +216,7 @@ pub struct XrSession {
     xr_context: Arc<XrContext>,
     graphics_context: Arc<GraphicsContext>,
     inner: xr::Session<xr::Vulkan>,
+    recommended_view_sizes: Vec<UVec2>,
     scene_swapchains: Vec<OpenxrSwapchain>,
     stream_swapchains: Vec<OpenxrSwapchain>,
     environment_blend_mode: xr::EnvironmentBlendMode,
@@ -254,7 +253,7 @@ impl XrSession {
             ))?
         };
 
-        let views = xr_context
+        let view_configs = xr_context
             .instance
             .enumerate_view_configuration_views(
                 xr_context.system,
@@ -262,17 +261,21 @@ impl XrSession {
             )
             .unwrap();
 
-        let scene_swapchains = views
+        let recommended_view_sizes = view_configs
             .into_iter()
             .map(|config| {
-                graphics_interop::create_swapchain(
-                    &graphics_context.device,
-                    &session,
-                    UVec2::new(
-                        config.recommended_image_rect_width,
-                        config.recommended_image_rect_height,
-                    ),
+                UVec2::new(
+                    config.recommended_image_rect_width,
+                    config.recommended_image_rect_height,
                 )
+            })
+            .collect::<Vec<_>>();
+
+        let scene_swapchains = recommended_view_sizes
+            .iter()
+            .cloned()
+            .map(|size| {
+                graphics_interop::create_swapchain(&graphics_context.device, &session, size)
             })
             .collect();
 
@@ -301,6 +304,7 @@ impl XrSession {
             xr_context,
             graphics_context,
             inner: session,
+            recommended_view_sizes,
             scene_swapchains,
             stream_swapchains,
             environment_blend_mode,
@@ -311,6 +315,10 @@ impl XrSession {
             frame_waiter: Mutex::new(frame_waiter),
             scene_predicted_display_timestamp: Mutex::new(xr::Time::from_nanos(0)),
         })
+    }
+
+    pub fn recommended_view_sizes(&self) -> &[UVec2] {
+        &self.recommended_view_sizes
     }
 
     pub fn update_for_stream(

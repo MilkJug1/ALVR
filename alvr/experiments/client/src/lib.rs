@@ -1,5 +1,6 @@
 mod connection;
 mod scene;
+mod storage;
 mod streaming_compositor;
 mod video_decoder;
 mod xr;
@@ -11,9 +12,10 @@ use alvr_common::{
     prelude::*,
     Fov,
 };
-use alvr_graphics::GraphicsContext;
+use alvr_graphics::{wgpu::Texture, GraphicsContext};
 use alvr_session::CodecType;
-use connection::VideoFrameMetadataPacket;
+use alvr_sockets::VideoFrameHeaderPacket;
+use connection::VideoStreamingComponents;
 use parking_lot::{Mutex, RwLock};
 use scene::Scene;
 use std::{
@@ -27,7 +29,6 @@ use tokio::{
     sync::Notify,
 };
 use video_decoder::VideoDecoder;
-use wgpu::Texture;
 
 const MAX_SESSION_LOOP_FAILS: usize = 5;
 
@@ -40,12 +41,6 @@ pub struct ViewConfig {
     orientation: Quat,
     position: Vec3,
     fov: Fov,
-}
-
-struct VideoStreamingComponents {
-    compositor: StreamingCompositor,
-    video_decoders: Vec<VideoDecoder>,
-    frame_metadata_receiver: crossbeam_channel::Receiver<VideoFrameMetadataPacket>,
 }
 
 #[cfg_attr(target_os = "android", ndk_glue::main)]
@@ -99,20 +94,9 @@ fn session_pipeline(
     let mut scene = Scene::new(Arc::clone(&graphics_context))?;
     log::error!("scene created");
 
-    let streaming_components = Arc::new(Mutex::new(None::<VideoStreamingComponents>));
+    let video_streaming_components = Arc::new(RwLock::new(None::<VideoStreamingComponents>));
 
-    let compositor =
-        StreamingCompositor::new(Arc::clone(&graphics_context), UVec2::new(100, 100), 1);
-
-    // let video_decoder = VideoDecoder::new(
-    //     Arc::clone(&graphics_context),
-    //     CodecType::H264,
-    //     UVec2::new(200, 100),
-    //     &[],
-    // )?;
-
-    let pause_notifier = Notify::new();
-
+    let pause_notifier = Arc::new(Notify::new());
     let mut runtime = None;
 
     // this is used to keep the last stream frame in place when the stream is stuck
@@ -123,9 +107,26 @@ fn session_pipeline(
         let mut presentation_guard = match xr_session_rlock.begin_frame()? {
             XrEvent::ShouldRender(guard) => {
                 if runtime.is_none() {
-                    runtime = Some(trace_err!(Runtime::new())?);
+                    let new_runtime = trace_err!(Runtime::new())?;
 
-                    // runtime.spawn()
+                    let pause_notifier = Arc::clone(&pause_notifier);
+                    let graphics_context = Arc::clone(&graphics_context);
+                    let xr_session = Arc::clone(&xr_session);
+                    let video_streaming_components = Arc::clone(&video_streaming_components);
+                    new_runtime.spawn(async move {
+                        let connection_loop = connection::connection_lifecycle_loop(
+                            graphics_context,
+                            xr_session,
+                            video_streaming_components,
+                        );
+
+                        tokio::select! {
+                            _ = connection_loop => (),
+                            _ = pause_notifier.notified() => (),
+                        }
+                    });
+
+                    runtime = Some(new_runtime)
                 }
 
                 guard
@@ -148,7 +149,7 @@ fn session_pipeline(
         };
 
         let maybe_stream_view_configs =
-            video_streaming_pipeline(&streaming_components, &mut presentation_guard);
+            video_streaming_pipeline(&video_streaming_components, &mut presentation_guard);
         presentation_guard.scene_view_configs =
             if let Some(stream_view_configs) = maybe_stream_view_configs.clone() {
                 stream_view_configs
@@ -183,10 +184,10 @@ fn session_pipeline(
 
 // Returns true if stream is updated for the current frame
 fn video_streaming_pipeline(
-    streaming_components: &Arc<Mutex<Option<VideoStreamingComponents>>>,
+    streaming_components: &Arc<RwLock<Option<VideoStreamingComponents>>>,
     presentation_guard: &mut XrPresentationGuard,
 ) -> Option<Vec<ViewConfig>> {
-    if let Some(streaming_components) = streaming_components.lock().as_ref() {
+    if let Some(streaming_components) = streaming_components.read().as_ref() {
         let decoder_target = streaming_components.compositor.input_texture();
 
         let timeout = Duration::from_micros(
@@ -203,9 +204,10 @@ fn video_streaming_pipeline(
 
         streaming_components.compositor.render(&compositor_target);
 
-        presentation_guard.display_timestamp = frame_metadata.timestamp;
+        // presentation_guard.display_timestamp = frame_metadata.timestamp;
 
-        Some(frame_metadata.view_configs)
+        // Some(frame_metadata.view_configs)
+        None
     } else {
         None
     }
@@ -216,7 +218,7 @@ fn get_video_frame_data(
     streaming_components: &VideoStreamingComponents,
     decoder_target: &Texture,
     timeout: Duration,
-) -> Option<VideoFrameMetadataPacket> {
+) -> Option<VideoFrameHeaderPacket> {
     let mut frame_metadata = streaming_components
         .frame_metadata_receiver
         .recv_timeout(timeout)
@@ -232,29 +234,29 @@ fn get_video_frame_data(
         );
     }
 
-    let greatest_timestamp = decoder_timestamps
-        .iter()
-        .cloned()
-        .fold(frame_metadata.timestamp, Duration::max);
+    // let greatest_timestamp = decoder_timestamps
+    //     .iter()
+    //     .cloned()
+    //     .fold(frame_metadata.timestamp, Duration::max);
 
-    while frame_metadata.timestamp < greatest_timestamp {
-        frame_metadata = streaming_components
-            .frame_metadata_receiver
-            .recv_timeout(timeout)
-            .ok()?;
-    }
+    // while frame_metadata.timestamp < greatest_timestamp {
+    //     frame_metadata = streaming_components
+    //         .frame_metadata_receiver
+    //         .recv_timeout(timeout)
+    //         .ok()?;
+    // }
 
-    for (mut timestamp, decoder) in decoder_timestamps
-        .into_iter()
-        .zip(streaming_components.video_decoders.iter())
-    {
-        while timestamp < greatest_timestamp {
-            timestamp = decoder
-                .get_output_frame(decoder_target, 0, timeout)
-                .ok()
-                .flatten()?;
-        }
-    }
+    // for (mut timestamp, decoder) in decoder_timestamps
+    //     .into_iter()
+    //     .zip(streaming_components.video_decoders.iter())
+    // {
+    //     while timestamp < greatest_timestamp {
+    //         timestamp = decoder
+    //             .get_output_frame(decoder_target, 0, timeout)
+    //             .ok()
+    //             .flatten()?;
+    //     }
+    // }
 
     Some(frame_metadata)
 }
