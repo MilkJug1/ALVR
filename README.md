@@ -1,5 +1,5 @@
-#This is going to be a base/starting point for the OLL project, this also may be modified too, since android apps on quest are weird!
-Also this is not an offical project, it might be modified.
+# **This is going to be a base/starting point for the OLL project, this also may be modified too, since android apps on quest are weird!
+Also this is not an offical project, it might be modified.**
 <p align="center"> <img width="500" src="resources/alvr_combined_logo_hq.png"/> </p>
 
 # ALVR - Air Light VR
