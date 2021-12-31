@@ -1,12 +1,12 @@
+#**This is going to be a base/starting point for the OLL project, this also may be modified too, since android apps on quest are weird!
+Also this is not an offical project, it might be modified**
 <p align="center"> <img width="500" src="resources/alvr_combined_logo_hq.png"/> </p>
 
 # ALVR - Air Light VR
 
 [![badge-discord][]][link-discord] [![badge-matrix][]][link-matrix] [![badge-opencollective][]][link-opencollective]
 
-**This is going to be a modified source of ALVR to enable wired streaming, kind of like Oculus Link, for Linux. This is not where the main branch of the source is at, to see the source, go to the [ORLL](https://github.com/MilkJug1/OculusLinkLinux).**
 
-Stream VR games from your PC to your headset via Wi-Fi.  
 ALVR uses technologies like [Asynchronous Timewarp](https://developer.oculus.com/documentation/native/android/mobile-timewarp-overview) and [Fixed Foveated Rendering](https://developer.oculus.com/documentation/native/android/mobile-ffr) for a smoother experience.  
 All games that work with an Oculus Rift (s) should work with ALVR.  
 This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
