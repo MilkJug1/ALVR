@@ -1,5 +1,5 @@
-#**This is going to be a base/starting point for the OLL project, this also may be modified too, since android apps on quest are weird!
-Also this is not an offical project, it might be modified**
+#This is going to be a base/starting point for the OLL project, this also may be modified too, since android apps on quest are weird!
+Also this is not an offical project, it might be modified.
 <p align="center"> <img width="500" src="resources/alvr_combined_logo_hq.png"/> </p>
 
 # ALVR - Air Light VR
@@ -28,28 +28,6 @@ This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
     -   NVIDIA GPU that supports NVENC ([Supported GPUs](https://github.com/polygraphene/ALVR/wiki/Supported-GPU)) (or with an AMD GPU that supports AMF VCE) with the latest driver.  
     -   Laptops with an onboard (Intel HD, AMD iGPU) and an additional dedicated GPU (NVidia GTX/RTX, AMD HD/R5/R7): you should assign the dedicated GPU or "high performance graphics adapter" to the applications ALVR, SteamVR for best performance and compatibility. (NVidia: Nvidia control panel->3d settings->application settings; AMD: similiar way) 
 
--   802.11ac 5Ghz wireless or ethernet wired connection  
-    -   It is recommended to use 802.11ac 5Ghz for the headset and ethernet for PC  
-    -   You need to connect both the PC and the headset to same router (or use a routed connection as described [here](https://github.com/alvr-org/ALVR/wiki/ALVR-client-and-server-on-separate-networks))
-
-## Install
-
-Follow the installation guide [here](https://github.com/alvr-org/ALVR/wiki/Installation).
-
-## Troubleshooting
-
--   Please check the [Troubleshooting](https://github.com/alvr-org/ALVR/wiki/Troubleshooting) page. The original repository [wiki](https://github.com/polygraphene/ALVR/wiki/Troubleshooting) can also help.  
--   Configuration recommendations and information may be found [here](https://github.com/alvr-org/ALVR/wiki/Configuration-Information-and-Recommendations)
-
-## Uninstall
-
-Open `ALVR Launcher.exe`, go to `Installation` tab then press `Remove firewall rules`. Close ALVR window and delete the ALVR folder.
-
-If you have a version prior to v12.0 you need to launch `remove_firewall_rules.bat` and `driver_uninstall.bat` in the installation folder.
-
-## Build from source
-
-You can follow the guide [here](https://github.com/alvr-org/ALVR/wiki/Building-From-Source).
 
 ## License
 
@@ -59,7 +37,7 @@ ALVR is licensed under the [MIT License](LICENSE).
 
 ALVR apps do not directly collect any kind of data.
 
-## Donate
+## Donate to the original devs
 
 If you want to support this project you can make a donation to our [Open Source Collective account](https://opencollective.com/alvr).
 
