@@ -13,13 +13,16 @@ use alvr_common::{
     Fov,
 };
 use alvr_graphics::{wgpu::Texture, GraphicsContext};
-use alvr_session::CodecType;
+use alvr_session::{CodecType, TrackingSpace};
 use alvr_sockets::VideoFrameHeaderPacket;
 use connection::VideoStreamingComponents;
 use parking_lot::{Mutex, RwLock};
 use scene::Scene;
 use std::{
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
@@ -28,9 +31,8 @@ use tokio::{
     runtime::{self, Runtime},
     sync::Notify,
 };
-use video_decoder::VideoDecoder;
 
-const MAX_SESSION_LOOP_FAILS: usize = 5;
+const MAX_RENDERING_LOOP_FAILS: usize = 5;
 
 // Timeout stream after this portion of frame interval. must be less than 1, so Phase Sync can
 // compensate for it.
@@ -59,11 +61,42 @@ fn run() -> StrResult {
 
     let graphics_context = Arc::new(xr::create_graphics_context(&xr_context)?);
 
+    let mut scene = Scene::new(Arc::clone(&graphics_context))?;
+
+    let xr_session = XrSession::new(
+        Arc::clone(&xr_context),
+        Arc::clone(&graphics_context),
+        UVec2::new(1, 1),
+        &[],
+        vec![],
+        TrackingSpace::Local,
+        openxr::EnvironmentBlendMode::OPAQUE,
+    )?;
+    let xr_session = Arc::new(RwLock::new(Some(xr_session)));
+
+    let video_streaming_components = Arc::new(Mutex::new(None));
+
+    let standby_status = Arc::new(AtomicBool::new(true));
+    let idr_request_notifier = Arc::new(Notify::new());
+
+    let runtime = trace_err!(Runtime::new())?;
+    runtime.spawn(connection::connection_lifecycle_loop(
+        xr_context,
+        graphics_context,
+        Arc::clone(&xr_session),
+        Arc::clone(&video_streaming_components),
+        Arc::clone(&standby_status),
+        Arc::clone(&idr_request_notifier),
+    ));
+
     let mut fails_count = 0;
     loop {
-        let res = show_err(session_pipeline(
-            Arc::clone(&xr_context),
-            Arc::clone(&graphics_context),
+        let res = show_err(rendering_loop(
+            &mut scene,
+            Arc::clone(&xr_session),
+            Arc::clone(&video_streaming_components),
+            Arc::clone(&standby_status),
+            Arc::clone(&idr_request_notifier),
         ));
 
         if res.is_some() {
@@ -73,91 +106,53 @@ fn run() -> StrResult {
 
             fails_count += 1;
 
-            if fails_count == MAX_SESSION_LOOP_FAILS {
-                log::error!("session loop failed {} times. Terminating.", fails_count);
+            if fails_count == MAX_RENDERING_LOOP_FAILS {
+                log::error!("Rendering loop failed {} times. Terminating.", fails_count);
                 break Ok(());
             }
         }
     }
 }
 
-fn session_pipeline(
-    xr_context: Arc<XrContext>,
-    graphics_context: Arc<GraphicsContext>,
+fn rendering_loop(
+    scene: &mut Scene,
+    xr_session: Arc<RwLock<Option<XrSession>>>,
+    video_streaming_components: Arc<Mutex<Option<VideoStreamingComponents>>>,
+    standby_status: Arc<AtomicBool>,
+    idr_request_notifier: Arc<Notify>,
 ) -> StrResult {
-    let xr_session = Arc::new(RwLock::new(XrSession::new(
-        Arc::clone(&xr_context),
-        Arc::clone(&graphics_context),
-    )?));
-    log::error!("session created");
-
-    let mut scene = Scene::new(Arc::clone(&graphics_context))?;
-    log::error!("scene created");
-
-    let video_streaming_components = Arc::new(RwLock::new(None::<VideoStreamingComponents>));
-
-    let pause_notifier = Arc::new(Notify::new());
-    let mut runtime = None;
-
     // this is used to keep the last stream frame in place when the stream is stuck
     let old_stream_view_configs = vec![];
 
     loop {
         let xr_session_rlock = xr_session.read();
-        let mut presentation_guard = match xr_session_rlock.begin_frame()? {
+        let xr_session = xr_session_rlock.as_ref().unwrap();
+        let mut presentation_guard = match xr_session.begin_frame()? {
             XrEvent::ShouldRender(guard) => {
-                if runtime.is_none() {
-                    let new_runtime = trace_err!(Runtime::new())?;
-
-                    let pause_notifier = Arc::clone(&pause_notifier);
-                    let graphics_context = Arc::clone(&graphics_context);
-                    let xr_session = Arc::clone(&xr_session);
-                    let video_streaming_components = Arc::clone(&video_streaming_components);
-                    new_runtime.spawn(async move {
-                        let connection_loop = connection::connection_lifecycle_loop(
-                            graphics_context,
-                            xr_session,
-                            video_streaming_components,
-                        );
-
-                        tokio::select! {
-                            _ = connection_loop => (),
-                            _ = pause_notifier.notified() => (),
-                        }
-                    });
-
-                    runtime = Some(new_runtime)
+                if standby_status.load(Ordering::Relaxed) {
+                    idr_request_notifier.notify_one();
+                    standby_status.store(false, Ordering::Relaxed);
                 }
 
                 guard
             }
             XrEvent::Idle => {
-                pause_notifier.notify_waiters();
-                runtime.take();
-
-                // Wait for sockets to shutdown
-                thread::sleep(Duration::from_millis(500));
-
+                standby_status.store(true, Ordering::Relaxed);
                 continue;
             }
-            XrEvent::Shutdown => {
-                pause_notifier.notify_waiters();
-                runtime.take();
-
-                return Ok(());
-            }
+            XrEvent::Shutdown => return Ok(()),
         };
 
         let maybe_stream_view_configs =
             video_streaming_pipeline(&video_streaming_components, &mut presentation_guard);
-        presentation_guard.scene_view_configs =
-            if let Some(stream_view_configs) = maybe_stream_view_configs.clone() {
-                stream_view_configs
-            } else {
-                old_stream_view_configs.clone()
-            };
+        presentation_guard.stream_view_configs =
+            // if let Some(stream_view_configs) = maybe_stream_view_configs.clone() {
+            //     stream_view_configs
+            // } else {
+                old_stream_view_configs.clone();
+        // };
 
-        let scene_input = xr_session_rlock.get_scene_input()?;
+        let scene_input = xr_session.get_scene_input()?;
 
         scene.update(
             scene_input.left_pose_input,
@@ -184,17 +179,15 @@ fn session_pipeline(
 
 // Returns true if stream is updated for the current frame
 fn video_streaming_pipeline(
-    streaming_components: &Arc<RwLock<Option<VideoStreamingComponents>>>,
+    streaming_components: &Arc<Mutex<Option<VideoStreamingComponents>>>,
     presentation_guard: &mut XrPresentationGuard,
-) -> Option<Vec<ViewConfig>> {
-    if let Some(streaming_components) = streaming_components.read().as_ref() {
-        let decoder_target = streaming_components.compositor.input_texture();
-
+) -> Option<()> {
+    if let Some(streaming_components) = &mut *streaming_components.lock() {
         let timeout = Duration::from_micros(
             (presentation_guard.predicted_frame_interval.as_micros() as f32
                 * FRAME_TIMEOUT_MULTIPLIER) as _,
         );
-        let frame_metadata = get_video_frame_data(streaming_components, decoder_target, timeout)?;
+        let frame_metadata = get_video_frame_data(streaming_components, timeout)?;
 
         let compositor_target = presentation_guard
             .acquired_stream_swapchains
@@ -207,7 +200,7 @@ fn video_streaming_pipeline(
         // presentation_guard.display_timestamp = frame_metadata.timestamp;
 
         // Some(frame_metadata.view_configs)
-        None
+        Some(())
     } else {
         None
     }
@@ -215,24 +208,26 @@ fn video_streaming_pipeline(
 
 // Dequeue decoded frames and metadata and makes sure they are on the same latest timestamp
 fn get_video_frame_data(
-    streaming_components: &VideoStreamingComponents,
-    decoder_target: &Texture,
+    streaming_components: &mut VideoStreamingComponents,
     timeout: Duration,
 ) -> Option<VideoFrameHeaderPacket> {
+    let decoder_target = streaming_components.compositor.input_texture();
+
     let mut frame_metadata = streaming_components
         .frame_metadata_receiver
         .recv_timeout(timeout)
         .ok()?;
 
     let mut decoder_timestamps = vec![];
-    for decoder in &streaming_components.video_decoders {
-        decoder_timestamps.push(
-            decoder
-                .get_output_frame(decoder_target, 0, timeout)
-                .ok()
-                .flatten()?,
-        );
+    for frame_grabber in &mut streaming_components.video_decoder_frame_grabbers {
+        let res = frame_grabber.get_output_frame(decoder_target, 0, timeout);
+
+        error!("frame dequeue: {:?}", res);
+
+        decoder_timestamps.push(res.ok()?);
     }
+
+    error!("frame decoded");
 
     // let greatest_timestamp = decoder_timestamps
     //     .iter()

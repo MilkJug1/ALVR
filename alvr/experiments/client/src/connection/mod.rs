@@ -8,14 +8,14 @@ use crate::{
     },
     storage,
     streaming_compositor::StreamingCompositor,
-    video_decoder::VideoDecoder,
-    xr::{XrActionType, XrProfileDesc, XrSession},
+    video_decoder::{self, VideoDecoderDequeuer, VideoDecoderFrameGrabber},
+    xr::{XrActionType, XrContext, XrProfileDesc, XrSession},
     ViewConfig,
 };
 use alvr_audio::{AudioDevice, AudioDeviceType};
 use alvr_common::{glam::UVec2, prelude::*, Haptics, TrackedDeviceType, ALVR_NAME, ALVR_VERSION};
 use alvr_graphics::GraphicsContext;
-use alvr_session::{AudioDeviceId, CodecType, SessionDesc};
+use alvr_session::{AudioDeviceId, CodecType, MediacodecDataType, SessionDesc, TrackingSpace};
 use alvr_sockets::{
     spawn_cancelable, ClientConfigPacket, ClientControlPacket, ClientHandshakePacket,
     HeadsetInfoPacket, Input, PeerType, ProtoControlSocket, ServerControlPacket,
@@ -31,10 +31,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    thread,
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, Notify},
+    sync::{futures::Notified, Mutex, Notify},
     time,
 };
 
@@ -46,7 +47,7 @@ const CLEANUP_PAUSE: Duration = Duration::from_millis(500);
 
 pub struct VideoStreamingComponents {
     pub compositor: StreamingCompositor,
-    pub video_decoders: Vec<VideoDecoder>,
+    pub video_decoder_frame_grabbers: Vec<VideoDecoderFrameGrabber>,
     pub frame_metadata_receiver: crossbeam_channel::Receiver<VideoFrameHeaderPacket>,
 }
 
@@ -62,12 +63,16 @@ impl Drop for StreamCloseGuard {
 }
 
 async fn connection_pipeline(
+    xr_context: Arc<XrContext>,
     graphics_context: Arc<GraphicsContext>,
-    xr_session: Arc<RwLock<XrSession>>,
-    video_streaming_components: Arc<RwLock<Option<VideoStreamingComponents>>>,
+    xr_session: Arc<RwLock<Option<XrSession>>>,
+    video_streaming_components: Arc<parking_lot::Mutex<Option<VideoStreamingComponents>>>,
+    standby_status: Arc<AtomicBool>,
+    idr_request_notifier: Arc<Notify>,
 ) -> StrResult {
     let config = storage::load_config()?;
     let hostname = config.hostname;
+    error!("hostname: {}", hostname);
 
     let handshake_packet = ClientHandshakePacket {
         alvr_name: ALVR_NAME.into(),
@@ -105,10 +110,7 @@ async fn connection_pipeline(
         } => pair
     };
 
-    let recommended_view_size = {
-        // let xr_session = xr_session.read();
-        xr_session.read().recommended_view_sizes()[0]
-    };
+    let recommended_view_size = xr_session.read().as_ref().unwrap().recommended_view_sizes()[0];
 
     let headset_info = HeadsetInfoPacket {
         recommended_eye_width: recommended_view_size.x,
@@ -187,28 +189,57 @@ async fn connection_pipeline(
         config_packet.eye_resolution_height,
     );
 
-    xr_session.write().update_for_stream(
-        target_view_size,
-        &[
-            ("x_press".into(), XrActionType::Binary),
-            ("a_press".into(), XrActionType::Binary),
-            // todo
-        ],
-        vec![XrProfileDesc {
-            profile: "/interaction_profiles/oculus/touch_controller".into(),
-            button_bindings: vec![
-                ("x_press".into(), "/user/hand/left/input/x/click".into()),
-                ("a_press".into(), "/user/hand/right/input/a/click".into()),
+    {
+        let xr_session_ref = &mut *xr_session.write();
+
+        // The Oculus Quest supports creating only one session at a time. Makes sure the old session
+        // is destroyed before recreating it.
+        *xr_session_ref = None;
+
+        let maybe_new_session = XrSession::new(
+            Arc::clone(&xr_context),
+            Arc::clone(&graphics_context),
+            target_view_size,
+            &[
+                ("x_press".into(), XrActionType::Binary),
+                ("a_press".into(), XrActionType::Binary),
                 // todo
             ],
-            tracked: true,
-            has_haptics: true,
-        }],
-        settings.headset.tracking_space,
-        openxr::EnvironmentBlendMode::OPAQUE,
-    );
+            vec![XrProfileDesc {
+                profile: "/interaction_profiles/oculus/touch_controller".into(),
+                button_bindings: vec![
+                    ("x_press".into(), "/user/hand/left/input/x/click".into()),
+                    ("a_press".into(), "/user/hand/right/input/a/click".into()),
+                    // todo
+                ],
+                tracked: true,
+                has_haptics: true,
+            }],
+            settings.headset.tracking_space,
+            openxr::EnvironmentBlendMode::OPAQUE,
+        );
 
-    let idr_request_notifier: Notify = Notify::new();
+        *xr_session_ref = match maybe_new_session {
+            Ok(session) => Some(session),
+            Err(e) => {
+                error!("Error recreating session for stream: {}", e);
+
+                // recreate a session for presenting the lobby room
+                Some(
+                    XrSession::new(
+                        Arc::clone(&xr_context),
+                        Arc::clone(&graphics_context),
+                        UVec2::new(1, 1),
+                        &[],
+                        vec![],
+                        TrackingSpace::Local,
+                        openxr::EnvironmentBlendMode::OPAQUE,
+                    )
+                    .unwrap(),
+                )
+            }
+        };
+    }
 
     // let input_send_loop = {
     //     let xr_session = Arc::clone(&xr_session);
@@ -233,84 +264,128 @@ async fn connection_pipeline(
     //     }
     // };
 
+    let (video_bridge_sender, video_bridge_receiver) = crossbeam_channel::unbounded();
     let video_receive_loop = {
-        let video_streaming_components = Arc::clone(&video_streaming_components);
         let mut receiver = stream_socket
             .subscribe_to_stream::<VideoFrameHeaderPacket>(VIDEO)
             .await?;
-        // let frame_metadata_sender = None;
-        let nal_parser = NalParser::new(settings.video.codec);
+
         async move {
             loop {
                 let packet = receiver.recv().await?;
 
-                // let nals = nal_parser.process_packet(&packet.buffer);
-
-                // for (nal_type, buffer) in nals {
-                //     match nal_type {
-                //         NalType::Config => {
-                //             if video_streaming_components.read().is_none() {
-                //                 let compositor = StreamingCompositor::new(
-                //                     Arc::clone(&graphics_context),
-                //                     target_view_size,
-                //                     1,
-                //                 );
-
-                //                 let video_decoders = vec![VideoDecoder::new(
-                //                     graphics_context,
-                //                     settings.video.codec,
-                //                     target_view_size,
-                //                     buffer,
-                //                     vec![
-                //                         (
-                //                             "operating-rate".into(),
-                //                             MediacodecDataType::Int32(i32::MAX),
-                //                         ),
-                //                         ("priority".into(), MediacodecDataType::Int32(0)),
-                //                         // low-latency: only applicable on API level 30. Quest 1 and 2 might not be
-                //                         // cabable, since they are on level 29.
-                //                         ("low-latency".into(), MediacodecDataType::Int32(1)),
-                //                         (
-                //                             "vendor.qti-ext-dec-low-latency.enable".into(),
-                //                             MediacodecDataType::Int32(1),
-                //                         ),
-                //                     ],
-                //                 )?];
-
-                //                 let (metadata_sender, metadata_receiver) =
-                //                     crossbeam_channel::unbounded();
-
-                //                 frame_metadata_sender = Some(metadata_sender);
-
-                //                 *video_streaming_components.write() =
-                //                     Some(VideoStreamingComponents {
-                //                         compositor,
-                //                         video_decoders,
-                //                         frame_metadata_receiver: metadata_receiver,
-                //                     });
-
-                //                 idr_request_notifier.notify_one();
-                //             }
-                //         }
-                //         NalType::Frame => {
-                //             if let Some(streaming_components) = &*video_streaming_components.read()
-                //             {
-                //                 let timestamp =
-                //                     Duration::from_nanos(packet.header.packet_counter as _); // fixme: this is nonsensical
-
-                //                 frame_metadata_sender.unwrap().send(packet.header);
-                //                 streaming_components.video_decoders[0].push_frame_nals(
-                //                     timestamp,
-                //                     &buffer,
-                //                     Duration::SECOND,
-                //                 )?
-                //             }
-                //         }
-                //     }
-                // }
+                video_bridge_sender.send(packet).ok();
             }
         }
     };
+
+    thread::spawn({
+        let idr_request_notifier = Arc::clone(&idr_request_notifier);
+        let video_streaming_components = Arc::clone(&video_streaming_components);
+        let standby_status = Arc::clone(&standby_status);
+        let nal_parser = NalParser::new(settings.video.codec);
+        move || {
+            show_err(move || -> StrResult {
+                let mut frame_metadata_sender = None;
+                let mut video_decoder_enqueuer = None;
+                while is_connected.load(Ordering::Relaxed) {
+                    let packet = if let Ok(packet) =
+                        video_bridge_receiver.recv_timeout(Duration::from_millis(500))
+                    {
+                        packet
+                    } else {
+                        break;
+                    };
+
+                    let nals = nal_parser.process_packet(packet.buffer.to_vec());
+
+                    for (nal_type, buffer) in nals {
+                        match nal_type {
+                            NalType::Config if video_streaming_components.lock().is_none() => {
+                                let compositor = StreamingCompositor::new(
+                                    Arc::clone(&graphics_context),
+                                    target_view_size,
+                                    1,
+                                );
+
+                                let (decoder_enqueuer, decoder_dequeuer, decoder_frame_grabber) =
+                                    video_decoder::split(
+                                        Arc::clone(&graphics_context),
+                                        settings.video.codec,
+                                        target_view_size,
+                                        buffer,
+                                        &[
+                                            (
+                                                "operating-rate".into(),
+                                                MediacodecDataType::Int32(i16::MAX as _),
+                                            ),
+                                            ("priority".into(), MediacodecDataType::Int32(0)),
+                                            // low-latency: only applicable on API level 30. Quest 1 and 2 might not be
+                                            // capable, since they are on level 29.
+                                            // ("low-latency".into(), MediacodecDataType::Int32(1)),
+                                            (
+                                                "vendor.qti-ext-dec-low-latency.enable".into(),
+                                                MediacodecDataType::Int32(1),
+                                            ),
+                                        ],
+                                    )?;
+                                video_decoder_enqueuer = Some(decoder_enqueuer);
+
+                                let is_connected = Arc::clone(&is_connected);
+                                thread::spawn(move || {
+                                    while is_connected.load(Ordering::Relaxed) {
+                                        show_err(decoder_dequeuer.poll(Duration::from_millis(500)));
+                                    }
+                                });
+
+                                let (metadata_sender, metadata_receiver) =
+                                    crossbeam_channel::unbounded();
+                                frame_metadata_sender = Some(metadata_sender);
+
+                                *video_streaming_components.lock() =
+                                    Some(VideoStreamingComponents {
+                                        compositor,
+                                        video_decoder_frame_grabbers: vec![decoder_frame_grabber],
+                                        frame_metadata_receiver: metadata_receiver,
+                                    });
+                            }
+                            _ => {
+                                if !standby_status.load(Ordering::Relaxed) {
+                                    if let Some(decoder_enqueuer) = &mut video_decoder_enqueuer {
+                                        let timestamp =
+                                            Duration::from_nanos(packet.header.packet_counter as _); // fixme: this is nonsensical
+
+                                        trace_err!(frame_metadata_sender
+                                            .as_ref()
+                                            .unwrap()
+                                            .send(packet.header.clone()))?;
+                                        let success = decoder_enqueuer.push_frame_nals(
+                                            timestamp,
+                                            &buffer,
+                                            Duration::from_millis(500),
+                                        )?;
+                                        if !success {
+                                            error!("decoder enqueue error! requesting IDR");
+                                            idr_request_notifier.notify_one();
+                                        }
+                                        error!("frame submitted to decoder");
+                                    } else {
+                                        error!(
+                                            "Frame discarded because decoder is not initialized"
+                                        );
+                                    }
+                                } else {
+                                    error!("Frame discarded because in standby");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            }());
+        }
+    });
 
     let haptics_receive_loop = {
         let mut receiver = stream_socket
@@ -364,6 +439,7 @@ async fn connection_pipeline(
             loop {
                 tokio::select! {
                     _ = idr_request_notifier.notified() => {
+                        error!("Sending IDR request");
                         control_sender.lock().await.send(&ClientControlPacket::RequestIdr).await?;
                     }
                     control_packet = control_receiver.recv() =>
@@ -413,21 +489,30 @@ async fn connection_pipeline(
 }
 
 pub async fn connection_lifecycle_loop(
+    xr_context: Arc<XrContext>,
     graphics_context: Arc<GraphicsContext>,
-    xr_session: Arc<RwLock<XrSession>>,
-    video_streaming_components: Arc<RwLock<Option<VideoStreamingComponents>>>,
+    xr_session: Arc<RwLock<Option<XrSession>>>,
+    video_streaming_components: Arc<parking_lot::Mutex<Option<VideoStreamingComponents>>>,
+    standby_status: Arc<AtomicBool>,
+    idr_request_notifier: Arc<Notify>,
 ) {
     loop {
         tokio::join!(
             async {
                 show_err(
                     connection_pipeline(
+                        Arc::clone(&xr_context),
                         Arc::clone(&graphics_context),
                         Arc::clone(&xr_session),
                         Arc::clone(&video_streaming_components),
+                        Arc::clone(&standby_status),
+                        Arc::clone(&idr_request_notifier),
                     )
                     .await,
                 );
+
+                // stop streming receiver and return to lobby
+                video_streaming_components.lock().take();
 
                 // let any running task or socket shutdown
                 time::sleep(CLEANUP_PAUSE).await;
